@@ -55,7 +55,7 @@ assert(cls('Rate limit reached, try again later').type==='QUOTA','限流訊息 �
 assert(cls(good.replace('こんにちは5','こんにちは５')).type==='VALIDATION','日文被改動 → VALIDATION（非截斷）');
 assert(cls(good.replace('00:00:06,000 --> 00:00:07,000','00:00:06,001 --> 00:00:07,000')).type==='VALIDATION','時間戳被改 → VALIDATION');
 assert(cls('Failed to fetch').type==='NETWORK','網路錯誤文字 → NETWORK（不拆批）');assert(cls('隨便一段文字').type==='VALIDATION','單塊無關文字 → VALIDATION（不誤判截斷）');
-assert(cls('').type==='VALIDATION','空白 → VALIDATION');
+assert(cls('').type==='EMPTY','空白 → EMPTY（本輪刻意變更）');
 // T4 save flow: failure counts, split only failed, saved untouched
 h=setup(450);
 h.els['field-trans-result'].value=bilingual(h.run('batchList[0].cues'));h.click('btn-save-current-batch');

@@ -1,0 +1,112 @@
+const fs=require('fs'),vm=require('vm');
+const html=fs.readFileSync(process.argv[2],'utf8');
+const script=html.match(/<script>([\s\S]*)<\/script>/)[1];
+const defaultVal=(html.match(/id="cfg-batch-size" value="(\d+)"/)||[])[1];
+function mkCtx(confirmAns=true){
+  const els={},handlers={};
+  const mk=(id)=>({id,value:'',textContent:'',className:'',disabled:false,style:{},children:[],
+    addEventListener(ev,fn){(handlers[id]=handlers[id]||{})[ev]=fn;},
+    appendChild(c){this.children.push(c)},setAttribute(){}});
+  const doc={getElementById(id){if(!els[id]){els[id]=mk(id);if(id==='cfg-batch-size')els[id].value=defaultVal;if(id==='cfg-start-seq')els[id].value='1';}return els[id]},
+    createElement(){return mk('x')},body:{appendChild(){},removeChild(){}}};
+  const ctx={document:doc,confirm:()=>confirmAns,alert(){},navigator:{clipboard:{writeText:async()=>{}}},
+    crypto:{subtle:{digest:async()=>new ArrayBuffer(32)}},TextEncoder,setTimeout(){},URL:{createObjectURL(){return ''},revokeObjectURL(){}},Blob:function(){},FileReader:function(){}};
+  vm.createContext(ctx);vm.runInContext(script,ctx);
+  const elsP=new Proxy(els,{get:(t,k)=>doc.getElementById(k)});return {ctx,els:elsP,click:(id)=>handlers[id].click(),run:(c)=>vm.runInContext(c,ctx)};
+}
+const assert=(c,m)=>{results.push([c?'PASS':'FAIL',m]);};
+const results=[];
+function rawSrt(n){let o=[];for(let i=1;i<=n;i++){const s=i*2,e=i*2+1;const f=x=>`00:${String(Math.floor(x/60)).padStart(2,'0')}:${String(x%60).padStart(2,'0')},000`;o.push(`${i}\n${f(s)} --> ${f(e)}\nこんにちは${i}`);}return o.join('\n\n');}
+function bilingual(cues){return cues.map(c=>`${c.rawSeqLine}\n${c.rawTimeLine}\n譯文${c.index}\n${c.ja}`).join('\n\n');}
+function setup(n,opts={}){const h=mkCtx(opts.confirm!==false);h.els['field-raw-ja'].value=rawSrt(n);h.run('isGlossaryVerified=true;loadedGlossaryRawContent="GLOSS"');h.click('btn-parse-raw');
+  if(opts.size!==undefined)h.els['cfg-batch-size'].value=String(opts.size);h.click('btn-apply-batch-config');return h;}
+const sizes=h=>h.run('batchList.map(b=>b.cues.length)').join(',');
+const P=(h,t,cues)=>h.ctx.parseAndValidateBilingualSrt(t,cues);
+const fmtT=x=>`00:${String(Math.floor(x/60)).padStart(2,'0')}:${String(x%60).padStart(2,'0')},000`;
+const bi=(cues,sep='\n\n',eol='\n')=>cues.map(c=>`${c.rawSeqLine}\n${c.rawTimeLine}\n譯文${c.index}\n${c.ja}`).join(sep).replace(/\n/g,eol);
+const ok=(r)=>r.errors.length===0&&r.cues.length>0;
+const chk=(name,cond,extra)=>assert(cond,name+(extra?'  ｜'+extra:''));
+// 201 條，批次大小 100
+let h=setup(201,{size:100});
+const sz=h.run('batchList.map(b=>b.cues.length)').join();
+chk('批次建立 100,100,1',sz==='100,100,1',sz);
+const b1=h.run('batchList[0].cues'),b2=h.run('batchList[1].cues'),b3=h.run('batchList[2].cues');
+chk('01 100 條正確、區塊間無空白行 → PASS',ok(P(h,bi(b1,'\n'),b1)));
+chk('02 100 條正確、區塊間有空白行 → PASS',ok(P(h,bi(b1,'\n\n'),b1)));
+chk('02b 無空白行 + CRLF → PASS',ok(P(h,bi(b1,'\n','\r\n'),b1)));
+chk('02c 有空白行 + CRLF → PASS',ok(P(h,bi(b1,'\n\n','\r\n'),b1)));
+chk('02d 前後多餘空白行 → PASS',ok(P(h,'\n\n'+bi(b1,'\n')+'\n\n\n',b1)));
+// 缺一條
+let miss=b1.filter(c=>c.index!==50);let r=P(h,bi(miss,'\n'),b1);
+chk('03 輸出缺少一條（#50）→ FAIL',r.errors.length>0&&/總段數不符.*99/.test(r.errors[0]),r.errors[0]);
+// 重複序號
+let txt=bi(b1,'\n').replace('\n51\n00:01:42,000','\n50\n00:01:42,000');
+r=P(h,txt,b1);chk('04 序號重複（#51 被改成 50）→ FAIL，回報重複序號',r.errors.some(e=>/重複序號: #50/.test(e)),r.errors[0]);
+// 時間戳被改
+r=P(h,bi(b1,'\n').replace(b1[9].rawTimeLine,b1[9].rawTimeLine.replace('-->','--> ').replace('--> ','-->')+' '),b1);
+chk('05 時間戳被修改（行尾空白）→ FAIL',r.errors.some(e=>/#10 時間戳行未整行逐字保留/.test(e)),r.errors[0]);
+r=P(h,bi(b1,'\n').replace(b1[9].rawTimeLine,'00:00:20,001 --> 00:00:21,000'),b1);
+chk('05b 時間戳數值被改 → FAIL',r.errors.some(e=>/時間戳行未整行逐字保留/.test(e)),r.errors[0]);
+// 日文被改
+r=P(h,bi(b1,'\n').replace('こんにちは30','こんにちは３０'),b1);
+chk('06 日文被改 → FAIL',r.errors.some(e=>/#30 日文原文未逐字保留/.test(e)),r.errors[0]);
+// 缺翻譯：整行刪除
+let t=bi(b1,'\n').replace('\n譯文20\n','\n');r=P(h,t,b1);
+chk('07 缺少繁中翻譯（整行不見）→ FAIL',r.errors.length>0,r.errors[0].slice(0,60));
+// 空翻譯行
+t=bi(b1,'\n').replace('\n譯文20\n','\n\n');r=P(h,t,b1);
+chk('07b 翻譯為空行 → FAIL，回報翻譯為空',r.errors.some(e=>/#20 繁體中文翻譯為空/.test(e)),r.errors[0]);
+t=bi(b1,'\n').replace('\n譯文20\n','\n   \n');r=P(h,t,b1);
+chk('07c 翻譯為空白字元 → FAIL',r.errors.some(e=>/#20 繁體中文翻譯為空/.test(e)),r.errors[0]);
+// 缺日文
+t=bi(b1,'\n').replace('\nこんにちは40',''); r=P(h,t,b1);
+chk('08 缺少原始日文 → FAIL',r.errors.length>0&&r.errors.some(e=>/#40|區塊/.test(e)),r.errors[0].slice(0,60));
+t=bi(b1,'\n\n').replace('\nこんにちは40','');r=P(h,t,b1);
+chk('08b 缺少原始日文（有空白行格式）→ FAIL，回報缺少內容',r.errors.some(e=>/#40 缺少內容/.test(e)),r.errors[0].slice(0,60));
+// 空輸入
+for(const [n,v] of [['空字串',''],['純空白','  \n \r\n']]){r=P(h,v,b1);chk('09 空輸入（'+n+'）→ FAIL，明確回報輸入為空',r.errors.length===1&&/輸入為空/.test(r.errors[0]),r.errors.join('|'));}
+let c=h.ctx.classifyBatchFailure('',b1,r.errors);chk('09b 分類器：空輸入 → EMPTY，不含「非單純截斷」',c.type==='EMPTY'&&!/非單純截斷/.test(c.advice({failCount:0})),c.label);
+// 第 2 批從 #101
+chk('10 第 2 批從 #101 開始，正確回覆 → PASS',ok(P(h,bi(b2,'\n'),b2))&&P(h,bi(b2,'\n'),b2).cues[0].index===101);
+r=P(h,bi(b1,'\n'),b2);chk('10b 把第 1 批的回覆貼到第 2 批 → FAIL',r.errors.length>0,r.errors[0].slice(0,50));
+chk('10c 第 3 批（只有 #201，一條）→ PASS',ok(P(h,bi(b3,'\n'),b3)));
+// 只有序號樣式數字
+t='1\n譯文\n日文\n2\n譯文2\n日文2';r=P(h,t,b1);
+chk('11 僅序號樣式數字、無時間戳 → FAIL，回報區塊解析失敗',r.errors.length===1&&/區塊解析失敗/.test(r.errors[0])&&r.cues.length===0,r.errors[0]);
+c=h.ctx.classifyBatchFailure(t,b1,r.errors);chk('11b 分類標示為解析失敗',/解析失敗/.test(c.label),c.label);
+t='以下是翻譯結果：\n'+bi(b1,'\n');r=P(h,t,b1);chk('11c 前方有說明文字 → FAIL，回報區塊前有無法歸屬內容',r.errors.some(e=>/第一個有效字幕區塊之前/.test(e)),r.errors[0]);
+t='```\n'+bi(b1,'\n')+'\n```';r=P(h,t,b1);chk('11d 含 Markdown 程式碼框 → FAIL（既有檢查仍有效）',r.errors.some(e=>/程式碼框/.test(e)));
+// 內容含純數字行，不得誤判
+let rawNum='1\n00:00:01,000 --> 00:00:02,000\n7\n\n2\n00:00:03,000 --> 00:00:04,000\n2024\n\n3\n00:00:05,000 --> 00:00:06,000\n100';
+let hn=mkCtx();hn.els['field-raw-ja'].value=rawNum;hn.run('isGlossaryVerified=true;loadedGlossaryRawContent="G"');hn.click('btn-parse-raw');
+let nc=hn.run('parsedRawCues');
+t=nc.map((c,i)=>`${c.rawSeqLine}\n${c.rawTimeLine}\n${[42,2,5][i]}\n${c.ja}`).join('\n');
+r=P(hn,t,nc);chk('12 日文/翻譯內容為純數字（7、2024、42、2、100）且無空白行 → PASS，不誤判成序號',ok(r)&&r.cues.length===3,r.errors[0]);
+// 多行日文
+let rawML='1\n00:00:01,000 --> 00:00:02,000\nこんにちは\nみなさん\n\n2\n00:00:03,000 --> 00:00:04,000\n一行だけ\n\n3\n00:00:05,000 --> 00:00:06,000\nA\nB\nC';
+let hm=mkCtx();hm.els['field-raw-ja'].value=rawML;hm.run('isGlossaryVerified=true;loadedGlossaryRawContent="G"');hm.click('btn-parse-raw');
+let mc=hm.run('parsedRawCues');chk('13 原始字幕多行日文解析（2、1、3 行）',mc.map(c=>c.jaLines.length).join()==='2,1,3');
+const mbi=(sep)=>mc.map(c=>`${c.rawSeqLine}\n${c.rawTimeLine}\n譯文${c.index}\n${c.jaLines.join('\n')}`).join(sep);
+chk('13a 多行日文、無空白行 → PASS，且保留為多行',ok(P(hm,mbi('\n'),mc))&&P(hm,mbi('\n'),mc).cues[0].ja==='こんにちは\nみなさん');
+chk('13b 多行日文、有空白行 → PASS',ok(P(hm,mbi('\n\n'),mc)));
+r=P(hm,mbi('\n').replace('\nみなさん',''),mc);chk('13c 多行日文被改成單行 → FAIL',r.errors.length>0,r.errors[0].slice(0,60));
+r=P(hm,mbi('\n').replace('みなさん','みなさま'),mc);chk('13d 多行日文第二行被改 → FAIL',r.errors.some(e=>/#1 日文原文未逐字保留/.test(e)));
+// 多餘區塊
+r=P(h,bi(b1,'\n')+'\n101\n00:03:22,000 --> 00:03:23,000\n多餘\n多餘日文',b1);chk('14 多出額外區塊 → FAIL，回報段數',r.errors.some(e=>/總段數不符.*預期應有 100.*實際解析出 101/.test(e)),r.errors[0]);
+// 錯誤訊息路由
+r=P(h,bi(b1,'\n').replace('こんにちは30','X'),b1);c=h.ctx.classifyBatchFailure(bi(b1,'\n').replace('こんにちは30','X'),b1,r.errors);
+chk('15 日文被改：分類只列出日文項目，不附加序號/時間戳/段數訊息',/日文原文／行數/.test(c.label)&&!/序號|時間戳|段數/.test(c.label)&&!/非單純截斷/.test(c.advice({failCount:0})),c.label);
+// UI 端到端：使用者回報的情境
+h=setup(201,{size:100});
+h.els['field-trans-result'].value=bi(h.run('batchList[0].cues'),'\n');h.click('btn-save-current-batch');
+chk('16 UI：第 1 批（無空白行）暫存 → SAVED',h.run('batchList[0].status')==='SAVED'&&/暫存 PASS/.test(h.els['status-verify'].textContent),h.els['status-verify'].textContent.slice(0,40));
+h.run('currentBatchIdx=1');h.els['field-trans-result'].value=bi(h.run('batchList[1].cues'),'\n').replace('こんにちは150','改');h.click('btn-save-current-batch');
+chk('17 UI：第 2 批日文被改 → 維持 PENDING，不暫存，錯誤只含對應項目',h.run('batchList[1].status')==='PENDING'&&/日文原文未逐字/.test(h.els['status-verify'].textContent)&&!/非單純截斷/.test(h.els['status-verify'].textContent));
+h.els['field-trans-result'].value=bi(h.run('batchList[1].cues'),'\n');h.click('btn-save-current-batch');
+h.run('currentBatchIdx=2');h.els['field-trans-result'].value=bi(h.run('batchList[2].cues'),'\n');h.click('btn-save-current-batch');
+h.click('btn-verify-all');chk('18 UI：三批皆暫存後全量校驗 PASS（201 條）',/全量校驗 PASS/.test(h.els['status-verify'].textContent)&&h.run('fullyVerifiedCues.length')===201,h.els['status-verify'].textContent.slice(0,30));
+// 截斷偵測在無空白行輸出下仍有效
+h=setup(201,{size:100});let bb=h.run('batchList[0].cues');let tr=bi(bb,'\n').split('\n').slice(0,4*60).join('\n');
+c=h.ctx.classifyBatchFailure(tr,bb,['x']);chk('19 無空白行輸出被截斷（60/100 條）→ 仍判為截斷',c.type==='TRUNCATED',c.label);
+console.log(results.map(r=>r.join('  ')).join('\n'));
+console.log('\nFAIL count:',results.filter(r=>r[0]==='FAIL').length,'/',results.length);

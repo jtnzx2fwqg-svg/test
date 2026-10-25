@@ -1,0 +1,85 @@
+const fs=require('fs'),vm=require('vm');
+const html=fs.readFileSync(process.argv[2],'utf8');
+const script=html.match(/<script>([\s\S]*)<\/script>/)[1];
+const defaultVal=(html.match(/id="cfg-batch-size" value="(\d+)"/)||[])[1];
+function mkCtx(confirmAns=true){
+  const els={},handlers={};
+  const mk=(id)=>({id,value:'',textContent:'',className:'',disabled:false,style:{},children:[],
+    addEventListener(ev,fn){(handlers[id]=handlers[id]||{})[ev]=fn;},
+    appendChild(c){this.children.push(c)},setAttribute(){}});
+  const doc={getElementById(id){if(!els[id]){els[id]=mk(id);if(id==='cfg-batch-size')els[id].value=defaultVal;if(id==='cfg-start-seq')els[id].value='1';}return els[id]},
+    createElement(){return mk('x')},body:{appendChild(){},removeChild(){}}};
+  const ctx={document:doc,confirm:()=>confirmAns,alert(){},navigator:{clipboard:{writeText:async()=>{}}},
+    crypto:{subtle:{digest:async()=>new ArrayBuffer(32)}},TextEncoder,setTimeout(){},URL:{createObjectURL(){return ''},revokeObjectURL(){}},Blob:function(){},FileReader:function(){}};
+  vm.createContext(ctx);vm.runInContext(script,ctx);
+  const elsP=new Proxy(els,{get:(t,k)=>doc.getElementById(k)});return {ctx,els:elsP,click:(id)=>handlers[id].click(),run:(c)=>vm.runInContext(c,ctx)};
+}
+const assert=(c,m)=>{results.push([c?'PASS':'FAIL',m]);};
+const results=[];
+function rawSrt(n){let o=[];for(let i=1;i<=n;i++){const s=i*2,e=i*2+1;const f=x=>`00:${String(Math.floor(x/60)).padStart(2,'0')}:${String(x%60).padStart(2,'0')},000`;o.push(`${i}\n${f(s)} --> ${f(e)}\nこんにちは${i}`);}return o.join('\n\n');}
+function bilingual(cues){return cues.map(c=>`${c.rawSeqLine}\n${c.rawTimeLine}\n譯文${c.index}\n${c.ja}`).join('\n\n');}
+function setup(n,opts={}){const h=mkCtx(opts.confirm!==false);h.els['field-raw-ja'].value=rawSrt(n);h.run('isGlossaryVerified=true;loadedGlossaryRawContent="GLOSS"');h.click('btn-parse-raw');
+  if(opts.size!==undefined)h.els['cfg-batch-size'].value=String(opts.size);h.click('btn-apply-batch-config');return h;}
+const sizes=h=>h.run('batchList.map(b=>b.cues.length)').join(',');
+// T1 default
+assert(defaultVal==='200','預設值為 200 (HTML value='+defaultVal+')');
+let h=setup(450);assert(sizes(h)==='200,200,50','450 段預設 → 200,200,50 實際 '+sizes(h));
+assert(h.run('batchList.every(b=>b.totalBatches===3)'),'totalBatches 動態為 3');
+assert(h.run('batchList[2].startSeq===401&&batchList[2].endSeq===450'),'最後一批 #401~#450');
+assert(/不得重新編號/.test(h.els['field-trans-prompt'].value),'Prompt 含不得重新編號/合併/拆分規則');
+for(const [sz,exp] of [[100,'100,100,100,100,50'],[300,'300,150'],[250,'250,200']]){h=setup(450,{size:sz});assert(sizes(h)===exp,`批次大小 ${sz} → ${exp} 實際 ${sizes(h)}`);}
+h=setup(450,{size:301});assert(h.run('batchList.length')===0&&/1 到 300/.test(h.els['status-prompt-info'].textContent),'301 被拒絕');
+h=setup(450,{size:0});assert(h.run('batchList.length')===0,'0 被拒絕');
+h=setup(450,{size:'abc'});assert(h.run('batchList.length')===0,'非數字被拒絕');
+h=setup(150);assert(sizes(h)==='150','總數 150 < 200 → 單批 150');
+h=setup(200);assert(sizes(h)==='200','總數剛好 200 → 單批');
+h=setup(201);assert(sizes(h)==='200,1','201 → 200,1（最後一批 1 條）');
+// T2 split
+h=setup(450);h.run('splitBatchAt(0)');
+assert(sizes(h)==='100,100,200,50','200 拆兩批 → 100,100,200,50 實際 '+sizes(h));
+assert(h.run('batchList[0].endSeq===100&&batchList[1].startSeq===101&&batchList[1].endSeq===200'),'子批序號連續 #1~100/#101~200，未重編');
+assert(h.run('batchList.map(b=>b.batchNum).join()')==='1,2,3,4'&&h.run('batchList.every(b=>b.totalBatches===4)'),'batchNum/totalBatches 動態更新為 4');
+assert(h.run('batchList.flatMap(b=>b.cues.map(c=>c.index)).join()===parsedRawCues.map(c=>c.index).join()'),'拆批後所有 index 順序與原始完全一致、無重複無遺漏');
+h.run('splitBatchAt(0)');h.run('splitBatchAt(0)');
+assert(sizes(h)==='50,50,100,200,50'.replace('50,50,100','50,50,100'),'連拆至深度2 → '+sizes(h));
+assert(h.run('splitBatchAt(0)')===false,'深度 2 後拒絕再拆');
+// T3 classification
+h=setup(20,{size:20});const cues=h.run('batchList[0].cues');
+const good=bilingual(cues);
+const cls=(t,errs)=>h.run('classifyBatchFailure')(t,cues,errs||['x']);
+const trunc=good.split('\n\n').slice(0,10).join('\n\n')+'\n\n11\n00:00:22,000 --> 00:00:23';
+assert(cls(trunc).type==='TRUNCATED','截斷（缺尾）→ TRUNCATED');
+assert(cls(good.split('\n\n').slice(0,12).join('\n\n')).type==='TRUNCATED','少段但前段完整 → TRUNCATED');
+assert(cls('429 RESOURCE_EXHAUSTED: You exceeded your current quota').type==='QUOTA','429 配額訊息 → QUOTA');
+assert(cls('Rate limit reached, try again later').type==='QUOTA','限流訊息 → QUOTA');
+assert(cls(good.replace('こんにちは5','こんにちは５')).type==='VALIDATION','日文被改動 → VALIDATION（非截斷）');
+assert(cls(good.replace('00:00:06,000 --> 00:00:07,000','00:00:06,001 --> 00:00:07,000')).type==='VALIDATION','時間戳被改 → VALIDATION');
+assert(cls('Failed to fetch').type==='NETWORK','網路錯誤文字 → NETWORK（不拆批）');assert(cls('隨便一段文字').type==='VALIDATION','單塊無關文字 → VALIDATION（不誤判截斷）');
+assert(cls('').type==='VALIDATION','空白 → VALIDATION');
+// T4 save flow: failure counts, split only failed, saved untouched
+h=setup(450);
+h.els['field-trans-result'].value=bilingual(h.run('batchList[0].cues'));h.click('btn-save-current-batch');
+assert(h.run('batchList[0].status')==='SAVED','批次1驗證通過並暫存');
+const savedRef=h.run('globalThis.__ref=batchList[0]');const savedSrt=h.run('batchList[0].savedSrt');
+h.run('currentBatchIdx=1;');
+const b2=bilingual(h.run('batchList[1].cues'));
+h.els['field-trans-result'].value=b2.split('\n\n').slice(0,150).join('\n\n');h.click('btn-save-current-batch');
+assert(h.run('batchList[1].status')==='PENDING'&&h.run('batchList[1].failCount')===1&&h.run('batchList[1].lastFailure')==='疑似輸出截斷','截斷失敗：批次2未標成功，failCount=1，類型=截斷');
+assert(/失敗類型/.test(h.els['status-verify'].textContent)&&/拆成兩批/.test(h.els['status-verify'].textContent),'失敗訊息建議拆批');
+h.click('btn-split-current-batch');
+assert(sizes(h)==='200,100,100,50','只拆失敗批次 → 200,100,100,50 實際 '+sizes(h));
+assert(h.run('batchList[0]===globalThis.__ref')&&h.run('batchList[0].status')==='SAVED'&&h.run('batchList[0].savedSrt')===savedSrt,'成功批次物件未被替換/重跑，內容不變');
+h.run('currentBatchIdx=0');h.click('btn-split-current-batch');
+assert(/拆批拒絕/.test(h.els['status-verify'].textContent)&&sizes(h)==='200,100,100,50','已成功批次拒絕拆分');
+// 完成其餘並全量校驗
+for(const i of [1,2,3]){h.run(`currentBatchIdx=${i}`);h.els['field-trans-result'].value=bilingual(h.run(`batchList[${i}].cues`));h.click('btn-save-current-batch');}
+assert(h.run('batchList.every(b=>b.status==="SAVED")'),'拆分後各批皆驗證暫存');
+h.click('btn-verify-all');
+assert(/全量校驗 PASS/.test(h.els['status-verify'].textContent)&&h.run('fullyVerifiedCues.length')===450,'全量校驗 PASS 且 450 條（無重複/遺漏）：'+h.els['status-verify'].textContent.slice(0,40));
+assert(h.run('fullyVerifiedCues.every((c,i)=>c.index===i+1)'),'合併順序與 index 完全一致');
+// 使用者取消確認 → 不拆
+h=setup(450,{confirm:false});h.click('btn-split-current-batch');assert(sizes(h)==='200,200,50','confirm 取消 → 不拆');
+// 拆後驗證被鎖
+h=setup(450);h.run('fullyVerifiedCues=[{index:1}]');h.click('btn-split-current-batch');assert(h.run('fullyVerifiedCues.length')===0,'拆批後全量校驗狀態被鎖定');
+console.log(results.map(r=>r.join('  ')).join('\n'));
+console.log('\nFAIL count:',results.filter(r=>r[0]==='FAIL').length,'/',results.length);

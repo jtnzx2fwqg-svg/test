@@ -1667,44 +1667,56 @@ document.getElementById('btn-clear-all-batches').addEventListener('click', () =>
 // ==================== 匯出字幕範圍完整性 ====================
 // 逐筆比對「原始字幕」與「已驗證輸出」的序號、順序、start、end、ja；
 // 不依賴 PASS 狀態、使用者設定的起始序號或段數。只計算、不修改任何資料。
+//
+// 欄位定義（彼此可對帳）：
+//   source_total  原始字幕總段數
+//   output_count  輸出（subtitles）的筆數
+//   matched_count 成功匹配的段數：序號存在於原始字幕、未重複、且 start／end／ja 與原始字幕完全一致
+//   missing_count 原始字幕中未被成功匹配的段數 = source_total - matched_count
+//   issue_count   問題筆數 = duplicate + unknown_index + mismatch + out_of_order
+//   issues.*      各類問題明細：duplicate 重複序號、unknown_index 不存在的序號、mismatch 內容（start／end／ja）不符、out_of_order 與原始字幕順序不同
+//   對帳關係：output_count = matched_count + duplicate + unknown_index + mismatch（錯序的筆數已含在 matched_count 內）
 function computeCoverage(sourceCues, verifiedCues) {
   const total = sourceCues.length;
   const posBySeq = new Map();
   sourceCues.forEach((c, i) => { if (!posBySeq.has(c.index)) posBySeq.set(c.index, i); });
   const seen = new Set();
-  const okPos = [];   // 與原始字幕完全吻合者在原始字幕中的位置（依已驗證輸出的順序）
-  let issues = 0;
+  const okPos = [];   // 成功匹配者在原始字幕中的位置（依輸出順序）
+  const issues = { duplicate: 0, unknown_index: 0, mismatch: 0, out_of_order: 0 };
 
   verifiedCues.forEach(v => {
     const p = posBySeq.get(v.index);
-    if (p === undefined) { issues++; return; }        // 序號不在原始字幕中
-    if (seen.has(v.index)) { issues++; return; }      // 重複序號
+    if (p === undefined) { issues.unknown_index++; return; }
+    if (seen.has(v.index)) { issues.duplicate++; return; }
     seen.add(v.index);
     const s = sourceCues[p];
-    if (v.start !== s.rawStart || v.end !== s.rawEnd || v.ja !== s.ja) { issues++; return; }   // start / end / ja 不一致
+    if (v.start !== s.rawStart || v.end !== s.rawEnd || v.ja !== s.ja) { issues.mismatch++; return; }
     okPos.push(p);
   });
   for (let i = 1; i < okPos.length; i++) {
-    if (okPos[i] <= okPos[i - 1]) issues++;           // 順序與原始字幕不同
+    if (okPos[i] <= okPos[i - 1]) issues.out_of_order++;
   }
 
   const sorted = okPos.slice().sort((a, b) => a - b);
   const matched = sorted.length;
   const span = matched ? (sorted[matched - 1] - sorted[0] + 1) : 0;
   const missingInRange = span - matched;
-  const consistent = issues === 0;
+  const issueCount = issues.duplicate + issues.unknown_index + issues.mismatch + issues.out_of_order;
+  const consistent = issueCount === 0;
   const complete = consistent && total > 0 && matched === total && verifiedCues.length === total;
   return {
     status: complete ? 'complete' : 'partial',
     consistent: consistent,
     source_total: total,
-    verified_count: verifiedCues.length,
+    output_count: verifiedCues.length,
+    matched_count: matched,
+    missing_count: total - matched,
+    issue_count: issueCount,
+    issues: issues,
     range_start_index: matched ? sourceCues[sorted[0]].index : null,
     range_end_index: matched ? sourceCues[sorted[matched - 1]].index : null,
     contiguous: consistent && matched > 0 && missingInRange === 0,
-    missing_count: total - matched,
-    missing_in_range: missingInRange,
-    issue_count: issues
+    missing_in_range: missingInRange
   };
 }
 
@@ -1712,12 +1724,30 @@ function describeCoverage(cv) {
   if (!cv) return '範圍完整性：未計算';
   const range = cv.range_start_index === null ? '無' : `#${cv.range_start_index} ~ #${cv.range_end_index}`;
   if (!cv.consistent) {
-    return `範圍完整性：【不一致，不視為完整】已驗證資料與原始字幕有 ${cv.issue_count} 處序號／順序／時間戳／日文對不上（原始 ${cv.source_total} 段，輸出 ${cv.verified_count} 段）`;
+    const i = cv.issues;
+    return `範圍完整性：【資料不一致】輸出 ${cv.output_count} 段、成功比對 ${cv.matched_count} 段、缺少 ${cv.missing_count} 段；問題 ${cv.issue_count} 處（重複序號 ${i.duplicate}、未知序號 ${i.unknown_index}、內容不符 ${i.mismatch}、錯序 ${i.out_of_order}）`;
   }
   if (cv.status === 'complete') {
-    return `範圍完整性：完整（原始 ${cv.source_total} 段，已驗證 ${cv.verified_count} 段，${range}）`;
+    return `範圍完整性：完整（原始 ${cv.source_total} 段全數逐筆吻合，${range}）`;
   }
-  return `範圍完整性：【部分結果】已驗證 ${cv.verified_count} / ${cv.source_total} 段（${range}，${cv.contiguous ? '連續區間' : '非連續'}），缺少 ${cv.missing_count} 段`;
+  return `範圍完整性：【部分結果】原始 ${cv.source_total} 段中成功比對 ${cv.matched_count} 段（${range}，${cv.contiguous ? '連續區間' : '非連續'}），缺少 ${cv.missing_count} 段`;
+}
+
+// 全量校驗完成後顯示的訊息：把「逐字與格式校驗」與「原始字幕範圍是否完整」分開呈現
+function buildVerifySummary(cv, warnCount) {
+  const warnLine = warnCount > 0 ? `\n（包含 ${warnCount} 項落在本次範圍內的時間戳警告，將保留至 JSON 匯出）` : '';
+  if (!cv.consistent) {
+    const i = cv.issues;
+    return { cls: 'status-msg err', text:
+      `【資料不一致・不視為完整】\n輸出 ${cv.output_count} 段、成功比對 ${cv.matched_count} 段、缺少 ${cv.missing_count} 段；問題 ${cv.issue_count} 處（重複序號 ${i.duplicate}、未知序號 ${i.unknown_index}、內容不符 ${i.mismatch}、錯序 ${i.out_of_order}）。\n請勿當成完整字幕使用。` + warnLine };
+  }
+  if (cv.status === 'complete') {
+    return { cls: 'status-msg ok', text:
+      `【範圍完整】原始字幕 ${cv.source_total} 段全數逐筆吻合。\n逐字與格式校驗：通過（序號、時間戳與日文原文逐字吻合）。\n已解鎖步驟 4 QC 檢查與 JSON 匯出。` + warnLine };
+  }
+  const range = `#${cv.range_start_index} ~ #${cv.range_end_index}`;
+  return { cls: 'status-msg warn', text:
+    `【部分結果・範圍不完整】原始字幕共 ${cv.source_total} 段，本次只比對成功 ${cv.matched_count} 段（${range}，${cv.contiguous ? '連續區間' : '非連續'}），缺少 ${cv.missing_count} 段。\n逐字與格式校驗：這 ${cv.output_count} 條字幕本身通過，但不代表整份字幕已完成。\n仍可匯出 JSON，coverage.status 會標示為 partial。` + warnLine };
 }
 
 // 全量校驗按鈕（統一單批與多批；詞庫未驗證硬阻擋）
@@ -1788,10 +1818,9 @@ document.getElementById('btn-verify-all').addEventListener('click', () => {
       message: w.message
     }));
 
-  statusEl.className = (lastCoverage.status === 'complete' && lastCoverage.consistent) ? 'status-msg ok' : 'status-msg warn';
-  statusEl.textContent = `【全量校驗 PASS】：共 ${transCues.length} 條字幕，段數、序號行、時間戳行與多行日文原文 100% 精準逐字吻合！已解鎖步驟 4 QC 檢查與 JSON 匯出。` +
-    (scopedWarnings.length > 0 ? `\n（包含 ${scopedWarnings.length} 項落在本次範圍內的時間戳警告，將保留至 JSON 匯出）` : '') +
-    `\n${describeCoverage(lastCoverage)}`;
+  const summary = buildVerifySummary(lastCoverage, scopedWarnings.length);
+  statusEl.className = summary.cls;
+  statusEl.textContent = summary.text;
 
   initQcBatchManager(transCues);
 
@@ -2069,7 +2098,7 @@ function updatePipeline() {
     `原始字幕：${rawParsePassed ? `已解析 ${parsedRawCues.length} 句（時間戳警告 ${globalRawWarnings.length} 項）` : "未解析"}\n` +
     `詞庫：${isGlossaryVerified ? "已通過結構驗證" : "未通過／未載入"}\n` +
     `批次：${batchList.length ? `已暫存 ${saved} / ${batchList.length}` : "尚未建立"}\n` +
-    `全量校驗：${fullyVerifiedCues.length ? `通過（${fullyVerifiedCues.length} 句）` : "未通過／未執行"}\n` +
+    `逐字與格式校驗：${fullyVerifiedCues.length ? `通過（${fullyVerifiedCues.length} 句）` : "未通過／未執行"}\n` +
     `${fullyVerifiedCues.length ? describeCoverage(lastCoverage) : "範圍完整性：尚無已驗證資料"}\n` +
     `播放器：${playerShowsTranslation ? "雙語（已校驗）" : (rawParsePassed ? "僅日文" : "無資料")}　匯出：${exportOn ? "可用" : "鎖定"}`;
 }

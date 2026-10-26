@@ -1806,7 +1806,7 @@ document.getElementById('btn-verify-all').addEventListener('click', () => {
 
   fullyVerifiedCues = transCues;
   lastCoverage = computeCoverage(parsedRawCues, fullyVerifiedCues);
-  document.getElementById('btn-export-json').disabled = false;
+  document.getElementById('btn-export-json').disabled = !lastCoverage.consistent;
 
   // 計算落在此次目標範圍內的 warnings（結構化物件陣列）
   const targetedSeqSet = new Set(fullyVerifiedCues.map(c => c.index));
@@ -1836,8 +1836,26 @@ document.getElementById('btn-verify-all').addEventListener('click', () => {
 });
 
 // 匯出相容 JSON（依本次字幕範圍嚴格隔離 warnings，並保留結構化物件）
-document.getElementById('btn-export-json').addEventListener('click', () => {
-  if (fullyVerifiedCues.length === 0 || !isGlossaryVerified) return;
+function exportVerifiedJson() {
+  if (fullyVerifiedCues.length === 0 || !isGlossaryVerified) return false;
+
+  // 匯出防線：不依賴按鈕狀態或既有 coverage 宣告，以原始字幕重新計算一致性
+  if (!rawParsePassed || parsedRawCues.length === 0) {
+    const st = document.getElementById('status-verify');
+    st.style.display = 'block'; st.className = 'status-msg err';
+    st.textContent = '【匯出被阻止】：原始字幕未通過解析，無法確認資料一致性。';
+    document.getElementById('btn-export-json').disabled = true;
+    return false;
+  }
+  const guardCv = computeCoverage(parsedRawCues, fullyVerifiedCues);
+  if (!guardCv.consistent) {
+    const gi = guardCv.issues;
+    const st = document.getElementById('status-verify');
+    st.style.display = 'block'; st.className = 'status-msg err';
+    st.textContent = `【匯出被阻止】：資料不一致（重複序號 ${gi.duplicate}、未知序號 ${gi.unknown_index}、內容不符 ${gi.mismatch}、錯序 ${gi.out_of_order}）。`;
+    document.getElementById('btn-export-json').disabled = true;
+    return false;
+  }
 
   const targetedSeqSet = new Set(fullyVerifiedCues.map(c => c.index));
   const scopedWarnings = globalRawWarnings
@@ -1869,7 +1887,9 @@ document.getElementById('btn-export-json').addEventListener('click', () => {
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 10000); // 延後 10 秒撤銷，確保跨瀏覽器下載順利啟動
-});
+  return true;
+}
+document.getElementById('btn-export-json').addEventListener('click', exportVerifiedJson);
 
 // ==================== 步驟 4：分批品質檢查（附完整詞庫） ====================
 function initQcBatchManager(cues) {
